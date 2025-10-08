@@ -1,0 +1,407 @@
+
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
+<title>Colab 互動冒險（v2：JSON 安全匯入 + 清空存檔）</title>
+<style>
+  html, body { margin:0; padding:0; background:#0e0f14; color:#e6e6ea; font-family: ui-sans-serif, system-ui, -apple-system, "PingFang TC","Noto Sans TC", Arial; }
+  #app { display:grid; grid-template-columns: 1fr 320px; gap:10px; padding:10px; box-sizing:border-box; }
+  #left { position:relative; }
+  canvas { background:#12131a; border:1px solid #262837; border-radius:6px; image-rendering: pixelated; }
+  #side { display:flex; flex-direction:column; gap:10px; }
+  .card { background:#141622; border:1px solid #262837; border-radius:8px; padding:10px; }
+  .title { font-weight:700; margin-bottom:6px; }
+  #log { height:160px; overflow:auto; background:#0f1120; border:1px solid #2a2d42; border-radius:6px; padding:6px; font-size:13px; line-height:1.35; }
+  .stat { display:inline-block; min-width:80px; }
+  #controls { display:grid; grid-template-columns: repeat(3, 70px); grid-template-rows: repeat(3, 50px); gap:6px; justify-content:center; }
+  #controls button, #toolbar button, .tilebtn { background:#1a1d2e; border:1px solid #2a2d42; color:#e6e6ea; border-radius:6px; }
+  #controls button:active { transform: translateY(1px); }
+  #toolbar { display:flex; gap:6px; flex-wrap:wrap; }
+  .badge { background:#1f2340; border:1px solid #2d325a; border-radius:999px; padding:2px 8px; font-size:12px; }
+  .palette { display:grid; grid-template-columns: repeat(7, 1fr); gap:6px; }
+  .tilebtn{ height:28px; border-radius:6px; font-size:12px; }
+  .tilebtn.selected { outline:2px solid #6aa6ff; }
+  @media (max-width:960px){ #app{ grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="left">
+    <canvas id="game" width="896" height="576"></canvas>
+  </div>
+  <div id="side">
+    <div class="card">
+      <div class="title">🎮 操作（v2 修正 JSON 匯入錯誤）</div>
+      <div style="font-size:14px; line-height:1.45">
+        移動：WASD / 方向鍵　|　互動：F　|　開關編輯器：Tab　|　存檔：P　|　讀檔：O　|　說明：H<br>
+        <b>匯入說明：</b>請先用「匯出 JSON」產生 <code>map.json</code>，再用「匯入 JSON」載入。同時支援安全檢查：若檔案不是 JSON（例如 HTML 以 &lt; 開頭），會顯示友善錯誤。
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="title">🧭 手機按鈕</div>
+      <div id="controls">
+        <div></div><button id="btn-up">▲</button><div></div>
+        <button id="btn-left">◀</button><button id="btn-interact">F</button><button id="btn-right">▶</button>
+        <div></div><button id="btn-down">▼</button><div></div>
+      </div>
+      <div id="toolbar" style="margin-top:6px;">
+        <button id="btn-edit">切換編輯(Tab)</button>
+        <button id="btn-help">說明(H)</button>
+        <button id="btn-save">存檔(P)</button>
+        <button id="btn-load">讀檔(O)</button>
+        <button id="btn-reset">清空存檔</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="title">📦 狀態</div>
+      <div>
+        <span class="stat">HP：<span id="hp">5</span></span>
+        <span class="stat">鑰匙：<span id="keys">0</span></span>
+        <span class="stat">模式：<span id="mode">探索</span></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="title">🧰 地圖編輯器（Tab 開關）</div>
+      <div style="font-size:13px; opacity:.9">編輯：點畫布繪製；數字 0–6 快速選磚。右上角門需鑰匙。</div>
+      <div class="palette" id="palette"></div>
+      <div style="margin-top:6px; display:flex; gap:6px; flex-wrap:wrap;">
+        <button id="btn-export">匯出 JSON</button>
+        <button id="btn-import">匯入 JSON</button>
+        <button id="btn-rand">隨機房間</button>
+        <button id="btn-template">載入示範地圖</button>
+        <span class="badge" id="cursorInfo">畫筆：地板</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="title">📝 訊息</div>
+      <div id="log"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  const TILE = 32;
+  const COLS = Math.floor(canvas.width / TILE);
+  const ROWS = Math.floor(canvas.height / TILE);
+
+  // Tile legend
+  const TILES = {
+    0: { name: '地板', color: '#1b1f2d' },
+    1: { name: '牆壁', color: '#2b3047' },
+    2: { name: '鑰匙', color: '#e7c84b' },
+    3: { name: '門(鎖)', color: '#88553a' },
+    4: { name: '寶箱', color: '#9b6d2e' },
+    5: { name: '水域', color: '#254b7a' },
+    6: { name: 'NPC', color: '#6aa6ff' },
+  };
+  let editorTile = 0;
+
+  function log(msg){
+    const el = document.getElementById('log');
+    const time = new Date().toLocaleTimeString();
+    el.innerHTML = `<div>[${time}] ${msg}</div>` + el.innerHTML;
+  }
+
+  // Map
+  let map = Array.from({length: ROWS}, (_,y)=>
+    Array.from({length: COLS}, (_,x)=> (x===0||y===0||x===COLS-1||y===ROWS-1)?1:0)
+  );
+  // Basic props
+  map[5][6] = 2;    // key
+  map[3][COLS-3] = 3; // door
+  map[ROWS-4][4] = 4; // chest
+  map[10][10] = 6;  // npc
+  for(let y=8;y<12;y++){for(let x=2;x<12;x++){ if(Math.random()<0.12) map[y][x]=5; }}
+  // A small inner room
+  for(let x=14;x<22;x++){ map[6][x]=1; map[12][x]=1; }
+  for(let y=6;y<13;y++){ map[y][14]=1; map[y][21]=1; }
+  map[9][21]=0; // opening
+  map[8][18]=4; // chest inside
+
+  // Player
+  let player = { x: 2, y: 2, hp: 5, keys: 0 };
+
+  // Game state
+  let inEditor = false;
+  let showingHelp = true;
+
+  // UI sync
+  function syncUI(){
+    document.getElementById('hp').textContent = player.hp;
+    document.getElementById('keys').textContent = player.keys;
+    document.getElementById('mode').textContent = inEditor ? '編輯' : '探索';
+  }
+
+  // Save/Load
+  function saveGame(){
+    try{
+      const data = { map, player };
+      localStorage.setItem('colab_game_save', JSON.stringify(data));
+      log('已存檔（localStorage）');
+    }catch(e){
+      log('存檔失敗：' + e.message);
+    }
+  }
+  function loadGame(){
+    try{
+      const txt = localStorage.getItem('colab_game_save');
+      if(!txt){ log('找不到存檔'); return; }
+      const trimmed = txt.trim();
+      if(!trimmed || (trimmed[0] !== '{' && trimmed[0] !== '[')){
+        throw new Error('存檔內容不是 JSON（可能被外部插入的 HTML）');
+      }
+      const data = JSON.parse(trimmed);
+      if(data.map && data.player){
+        map = data.map;
+        player = data.player;
+        log('已載入存檔');
+      } else {
+        throw new Error('結構不符（應包含 map 與 player）');
+      }
+    }catch(e){
+      log('讀檔失敗：' + e.message + '（可按「清空存檔」重置）');
+    }
+  }
+  function resetSave(){
+    try{
+      localStorage.removeItem('colab_game_save');
+      log('已清空存檔');
+    }catch(e){
+      log('清空失敗：' + e.message);
+    }
+  }
+
+  // Export/Import Map
+  function exportMap(){
+    try{
+      const blob = new Blob([JSON.stringify({map}, null, 2)], {type:'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'map.json'; a.click();
+      URL.revokeObjectURL(url);
+      log('已匯出 map.json');
+    }catch(e){
+      log('匯出失敗：' + e.message);
+    }
+  }
+  function importMap(){
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = '.json,application/json';
+    inp.onchange = () => {
+      const file = inp.files[0];
+      const reader = new FileReader();
+      reader.onload = () => {
+        try{
+          const raw = reader.result;
+          const trimmed = (raw||'').trim();
+          if(!trimmed || (trimmed[0] !== '{' && trimmed[0] !== '[')){
+            throw new Error('此檔案不是 JSON。可能你選到了 HTML/網頁檔（以 "<" 開頭）。請用「匯出 JSON」產生 map.json 後再匯入。');
+          }
+          const data = JSON.parse(trimmed);
+          if(data.map && Array.isArray(data.map)){
+            map = data.map;
+            log('已匯入地圖');
+          } else {
+            throw new Error('格式不正確，需為 { "map": [...] }');
+          }
+        } catch(e){
+          log('匯入失敗：' + e.message);
+        }
+      };
+      reader.readAsText(file);
+    };
+    inp.click();
+  }
+
+  // Template
+  function loadTemplate(){
+    const template = [];
+    for(let y=0;y<ROWS;y++){
+      const row = [];
+      for(let x=0;x<COLS;x++){
+        let v = (x===0||y===0||x===COLS-1||y===ROWS-1)?1:0;
+        if(y>4 && y<ROWS-4 && x>4 && x<COLS-4 && (x+y)%7===0) v=1;
+        row.push(v);
+      }
+      template.push(row);
+    }
+    template[2][2] = 2;
+    template[3][COLS-3] = 3;
+    template[ROWS-4][4] = 4;
+    template[12][12] = 6;
+    map = template;
+    log('已載入示範地圖');
+  }
+
+  // Random room
+  function randomRoom(){
+    const rx = 2 + Math.floor(Math.random()*(COLS-10));
+    const ry = 2 + Math.floor(Math.random()*(ROWS-8));
+    const w = 6 + Math.floor(Math.random()*8);
+    const h = 4 + Math.floor(Math.random()*6);
+    for(let y=ry;y<ry+h;y++){
+      for(let x=rx;x<rx+w;x++){
+        if (x===rx||y===ry||x===rx+w-1||y===ry+h-1) map[y][x]=1; else map[y][x]=0;
+      }
+    }
+    map[ry+Math.floor(h/2)][rx+w-1]=0;
+    map[ry+1][rx+1]=4;
+    map[ry+2][rx+2]=2;
+    log('已生成隨機房間');
+  }
+
+  function isWalkable(x,y){
+    if(x<0||y<0||x>=COLS||y>=ROWS) return false;
+    const t = map[y][x];
+    return !(t===1 || t===3);
+  }
+
+  function drawTile(x,y,t){
+    const T = TILES[t] ? t : 0;
+    const info = TILES[T];
+    ctx.fillStyle = info.color;
+    ctx.fillRect(x*TILE, y*TILE, TILE, TILE);
+
+    if(T===1){
+      ctx.strokeStyle = '#3a3f58';
+      ctx.setLineDash([8,8]);
+      ctx.strokeRect(x*TILE+2, y*TILE+2, TILE-4, TILE-4);
+      ctx.setLineDash([]);
+    } else if(T===2){
+      ctx.fillStyle = '#2b2e45'; ctx.fillRect(x*TILE+8, y*TILE+12, TILE-16, 8);
+      ctx.fillStyle = '#e7c84b'; ctx.fillRect(x*TILE+10, y*TILE+14, TILE-20, 4);
+      ctx.beginPath(); ctx.arc(x*TILE+TILE-10, y*TILE+16, 5, 0, Math.PI*2); ctx.fill();
+    } else if(T===3){
+      ctx.fillStyle = '#5f3a28'; ctx.fillRect(x*TILE+4, y*TILE+4, TILE-8, TILE-8);
+      ctx.fillStyle = '#2a170f'; ctx.fillRect(x*TILE+TILE/2-2, y*TILE+TILE/2-2, 4, 4);
+    } else if(T===4){
+      ctx.fillStyle = '#a77935'; ctx.fillRect(x*TILE+4, y*TILE+8, TILE-8, TILE-8);
+      ctx.fillStyle = '#e7c84b'; ctx.fillRect(x*TILE+4, y*TILE+14, TILE-8, 2);
+    } else if(T===5){
+      for(let i=0;i<3;i++){ ctx.strokeStyle = '#3d78b8'; ctx.beginPath();
+        ctx.arc(x*TILE+8+i*8, y*TILE+16, 6, Math.PI*0.2, Math.PI*1.2); ctx.stroke(); }
+    } else if(T===6){
+      ctx.fillStyle = '#cde0ff'; ctx.beginPath(); ctx.arc(x*TILE+16, y*TILE+16, 8, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#1b1f2d'; ctx.fillRect(x*TILE+10, y*TILE+20, 12, 6);
+    }
+  }
+
+  function draw(){
+    ctx.fillStyle = '#0e0f14'; ctx.fillRect(0,0,canvas.width,canvas.height);
+    for(let y=0;y<ROWS;y++){ for(let x=0;x<COLS;x++){ drawTile(x,y,map[y][x]); } }
+    ctx.fillStyle = '#f5a97f'; ctx.beginPath(); ctx.arc(player.x*TILE+TILE/2, player.y*TILE+TILE/2, TILE*0.35, 0, Math.PI*2); ctx.fill();
+    if(showingHelp){
+      ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(20,20,canvas.width-40,120);
+      ctx.fillStyle = '#e6e6ea'; ctx.font = '16px ui-sans-serif';
+      ctx.fillText('提示：WASD/方向鍵移動，F互動，Tab切換編輯。門需要鑰匙，寶箱可拿物品，NPC會說話。',30,60);
+      ctx.fillText('匯入 JSON 強化：若檔案不是 JSON（像 HTML 以 "<" 開頭）會顯示友善錯誤。',30,86);
+      ctx.fillText('存/讀檔：P / O；清空存檔按鈕可重置 localStorage。',30,112);
+    }
+  }
+
+  function tryInteract(){
+    const t = map[player.y][player.x];
+    if(t===2){ player.keys += 1; map[player.y][player.x] = 0; log('你撿到了一把鑰匙'); }
+    else if(t===4){ log('你打開寶箱，得到 +1 HP'); player.hp = Math.min(9, player.hp+1); map[player.y][player.x] = 0; }
+    else {
+      const dirs = [[0,-1],[1,0],[0,1],[-1,0]];
+      for(const [dx,dy] of dirs){
+        const x = player.x + dx, y = player.y + dy;
+        if(x<0||y<0||x>=COLS||y>=ROWS) continue;
+        const tt = map[y][x];
+        if(tt===3){
+          if(player.keys>0){ player.keys -= 1; map[y][x] = 0; log('你用鑰匙打開了門'); }
+          else { log('門被鎖住了，需要鑰匙'); }
+          break;
+        } else if(tt===6){ log('NPC：地圖可以自由編輯；想看範例就按「載入示範地圖」。'); break; }
+      }
+    }
+    syncUI();
+  }
+
+  function move(dx,dy){
+    if(inEditor) return;
+    const nx = player.x + dx, ny = player.y + dy;
+    if(!isWalkable(nx,ny)) return;
+    player.x = nx; player.y = ny;
+    if(map[ny][nx]===5 && Math.random() < 0.08){
+      player.hp = Math.max(1, player.hp-1);
+      log('你在水裡滑了一跤（-1 HP）');
+      syncUI();
+    }
+  }
+
+  function toggleEditor(){ inEditor = !inEditor; syncUI(); log(inEditor?'進入編輯模式':'離開編輯模式'); }
+
+  const keymap = {
+    'ArrowUp':[0,-1],'KeyW':[0,-1],
+    'ArrowDown':[0,1],'KeyS':[0,1],
+    'ArrowLeft':[-1,0],'KeyA':[-1,0],
+    'ArrowRight':[1,0],'KeyD':[1,0],
+  };
+  window.addEventListener('keydown', (e)=>{
+    if(e.code in keymap){ e.preventDefault(); const [dx,dy]=keymap[e.code]; move(dx,dy); draw(); return; }
+    if(e.code==='KeyF'){ tryInteract(); draw(); }
+    if(e.code==='Tab'){ e.preventDefault(); toggleEditor(); draw(); }
+    if(e.code==='KeyH'){ showingHelp=!showingHelp; draw(); }
+    if(e.code==='KeyP'){ saveGame(); }
+    if(e.code==='KeyO'){ loadGame(); draw(); }
+    if(/^Digit[0-6]$/.test(e.code) && inEditor){ editorTile=parseInt(e.code.replace('Digit','')); updatePalette(); }
+  });
+
+  document.getElementById('btn-up').onclick = ()=>{ move(0,-1); draw(); };
+  document.getElementById('btn-down').onclick = ()=>{ move(0,1); draw(); };
+  document.getElementById('btn-left').onclick = ()=>{ move(-1,0); draw(); };
+  document.getElementById('btn-right').onclick = ()=>{ move(1,0); draw(); };
+  document.getElementById('btn-interact').onclick = ()=>{ tryInteract(); draw(); };
+  document.getElementById('btn-edit').onclick = ()=>{ toggleEditor(); draw(); };
+  document.getElementById('btn-help').onclick = ()=>{ showingHelp=!showingHelp; draw(); };
+  document.getElementById('btn-save').onclick = ()=>{ saveGame(); };
+  document.getElementById('btn-load').onclick = ()=>{ loadGame(); draw(); };
+  document.getElementById('btn-reset').onclick = ()=>{ resetSave(); };
+  document.getElementById('btn-export').onclick = ()=>{ exportMap(); };
+  document.getElementById('btn-import').onclick = ()=>{ importMap(); };
+  document.getElementById('btn-rand').onclick = ()=>{ randomRoom(); draw(); };
+  document.getElementById('btn-template').onclick = ()=>{ loadTemplate(); draw(); };
+
+  function updatePalette(){
+    const pal = document.getElementById('palette'); pal.innerHTML = '';
+    for(const [k,v] of Object.entries(TILES)){
+      const b = document.createElement('button');
+      b.className = 'tilebtn' + (parseInt(k)===editorTile? ' selected':'');
+      b.textContent = `${k}:${v.name}`; b.style.background = v.color;
+      b.onclick = ()=>{ editorTile=parseInt(k); updatePalette(); };
+      pal.appendChild(b);
+    }
+    document.getElementById('cursorInfo').textContent = '畫筆：' + TILES[editorTile].name;
+  }
+
+  function isWalkable(x,y){
+    if(x<0||y<0||x>=COLS||y>=ROWS) return false;
+    const t = map[y][x];
+    return !(t===1 || t===3);
+  }
+
+  function fitCanvas(){
+    const containerW = document.getElementById('left').clientWidth;
+    const scale = Math.min(1, containerW / 896);
+    canvas.style.transformOrigin = 'top left';
+    canvas.style.transform = `scale(${scale})`;
+  }
+  window.addEventListener('resize', fitCanvas);
+
+  updatePalette(); syncUI(); log('v2 啟動：JSON 匯入強化 + 清空存檔按鈕'); draw(); fitCanvas();
+})();
+</script>
+</body>
+</html>
